@@ -10,15 +10,35 @@ fn get_block_size() -> u64 {
     512
 }
 
+type InodeAndDevice = (u64, u64);
+type FileTime = (i64, i64, i64);
+
 #[cfg(target_family = "unix")]
-pub fn get_metadata(d: &Path, use_apparent_size: bool) -> Option<(u64, Option<(u64, u64)>)> {
+pub fn get_metadata<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
     use std::os::unix::fs::MetadataExt;
-    match d.metadata() {
+    let metadata = if follow_links {
+        path.as_ref().metadata()
+    } else {
+        path.as_ref().symlink_metadata()
+    };
+    match metadata {
         Ok(md) => {
             if use_apparent_size {
-                Some((md.len(), Some((md.ino(), md.dev()))))
+                Some((
+                    md.len(),
+                    Some((md.ino(), md.dev())),
+                    (md.mtime(), md.atime(), md.ctime()),
+                ))
             } else {
-                Some((md.blocks() * get_block_size(), Some((md.ino(), md.dev()))))
+                Some((
+                    md.blocks() * get_block_size(),
+                    Some((md.ino(), md.dev())),
+                    (md.mtime(), md.atime(), md.ctime()),
+                ))
             }
         }
         Err(_e) => None,
@@ -26,7 +46,11 @@ pub fn get_metadata(d: &Path, use_apparent_size: bool) -> Option<(u64, Option<(u
 }
 
 #[cfg(target_family = "windows")]
-pub fn get_metadata(d: &Path, _use_apparent_size: bool) -> Option<(u64, Option<(u64, u64)>)> {
+pub fn get_metadata<P: AsRef<Path>>(
+    path: P,
+    use_apparent_size: bool,
+    follow_links: bool,
+) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
     // On windows opening the file to get size, file ID and volume can be very
     // expensive because 1) it causes a few system calls, and more importantly 2) it can cause
     // windows defender to scan the file.
@@ -65,7 +89,7 @@ pub fn get_metadata(d: &Path, _use_apparent_size: bool) -> Option<(u64, Option<(
 
     use std::io;
     use winapi_util::Handle;
-    fn handle_from_path_limited<P: AsRef<Path>>(path: P) -> io::Result<Handle> {
+    fn handle_from_path_limited(path: &Path) -> io::Result<Handle> {
         use std::fs::OpenOptions;
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_READ_ATTRIBUTES: u32 = 0x0080;
@@ -90,20 +114,47 @@ pub fn get_metadata(d: &Path, _use_apparent_size: bool) -> Option<(u64, Option<(
         Ok(Handle::from_file(file))
     }
 
-    fn get_metadata_expensive(d: &Path) -> Option<(u64, Option<(u64, u64)>)> {
+    fn get_metadata_expensive(
+        path: &Path,
+        use_apparent_size: bool,
+    ) -> Option<(u64, Option<InodeAndDevice>, FileTime)> {
         use winapi_util::file::information;
 
-        let h = handle_from_path_limited(d).ok()?;
+        let h = handle_from_path_limited(path).ok()?;
         let info = information(&h).ok()?;
 
-        Some((
-            info.file_size(),
-            Some((info.file_index(), info.volume_serial_number())),
-        ))
+        if use_apparent_size {
+            use filesize::PathExt;
+            Some((
+                path.size_on_disk().ok()?,
+                Some((info.file_index(), info.volume_serial_number())),
+                (
+                    info.last_write_time().unwrap() as i64,
+                    info.last_access_time().unwrap() as i64,
+                    info.creation_time().unwrap() as i64,
+                ),
+            ))
+        } else {
+            Some((
+                info.file_size(),
+                Some((info.file_index(), info.volume_serial_number())),
+                (
+                    info.last_write_time().unwrap() as i64,
+                    info.last_access_time().unwrap() as i64,
+                    info.creation_time().unwrap() as i64,
+                ),
+            ))
+        }
     }
 
     use std::os::windows::fs::MetadataExt;
-    match d.metadata() {
+    let path = path.as_ref();
+    let metadata = if follow_links {
+        path.metadata()
+    } else {
+        path.symlink_metadata()
+    };
+    match metadata {
         Ok(ref md) => {
             const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x20;
             const FILE_ATTRIBUTE_READONLY: u32 = 0x01;
@@ -111,18 +162,39 @@ pub fn get_metadata(d: &Path, _use_apparent_size: bool) -> Option<(u64, Option<(
             const FILE_ATTRIBUTE_SYSTEM: u32 = 0x04;
             const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
             const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-
+            const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x00000200;
+            const FILE_ATTRIBUTE_PINNED: u32 = 0x00080000;
+            const FILE_ATTRIBUTE_UNPINNED: u32 = 0x00100000;
+            const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x00040000;
+            const FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS: u32 = 0x00400000;
+            const FILE_ATTRIBUTE_OFFLINE: u32 = 0x00001000;
+            // normally FILE_ATTRIBUTE_SPARSE_FILE would be enough, however Windows sometimes likes to mask it out. see: https://stackoverflow.com/q/54560454
+            const IS_PROBABLY_ONEDRIVE: u32 = FILE_ATTRIBUTE_SPARSE_FILE
+                | FILE_ATTRIBUTE_PINNED
+                | FILE_ATTRIBUTE_UNPINNED
+                | FILE_ATTRIBUTE_RECALL_ON_OPEN
+                | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+                | FILE_ATTRIBUTE_OFFLINE;
             let attr_filtered = md.file_attributes()
                 & !(FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_SYSTEM);
-            if (attr_filtered & FILE_ATTRIBUTE_ARCHIVE) != 0
+            if ((attr_filtered & FILE_ATTRIBUTE_ARCHIVE) != 0
                 || (attr_filtered & FILE_ATTRIBUTE_DIRECTORY) != 0
-                || md.file_attributes() == FILE_ATTRIBUTE_NORMAL
+                || md.file_attributes() == FILE_ATTRIBUTE_NORMAL)
+                && !((attr_filtered & IS_PROBABLY_ONEDRIVE != 0) && use_apparent_size)
             {
-                Some((md.len(), None))
+                Some((
+                    md.len(),
+                    None,
+                    (
+                        md.last_write_time() as i64,
+                        md.last_access_time() as i64,
+                        md.creation_time() as i64,
+                    ),
+                ))
             } else {
-                get_metadata_expensive(d)
+                get_metadata_expensive(path, use_apparent_size)
             }
         }
-        _ => get_metadata_expensive(d),
+        _ => get_metadata_expensive(path, use_apparent_size),
     }
 }
