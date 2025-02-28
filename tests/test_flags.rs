@@ -60,10 +60,17 @@ pub fn test_d_flag_works() {
 }
 
 #[test]
+pub fn test_threads_flag_works() {
+    let output = build_command(vec!["-T", "1", "tests/test_dir/"]);
+    assert!(output.contains("hello_file"));
+}
+
+#[test]
 pub fn test_d_flag_works_and_still_recurses_down() {
     // We had a bug where running with '-d 1' would stop at the first directory and the code
     // would fail to recurse down
     let output = build_command(vec!["-d", "1", "-f", "-c", "tests/test_dir2/"]);
+    assert!(output.contains("1   ┌── dir"));
     assert!(output.contains("4 ┌─┴ test_dir2"));
 }
 
@@ -75,11 +82,23 @@ pub fn test_ignore_dir() {
 }
 
 #[test]
+pub fn test_ignore_all_in_file() {
+    let output = build_command(vec![
+        "-c",
+        "-I",
+        "tests/test_dir_hidden_entries/.hidden_file",
+        "tests/test_dir_hidden_entries/",
+    ]);
+    assert!(output.contains(" test_dir_hidden_entries"));
+    assert!(!output.contains(".secret"));
+}
+
+#[test]
 pub fn test_with_bad_param() {
     let mut cmd = Command::cargo_bin("dust").unwrap();
     let result = cmd.arg("bad_place").unwrap();
     let stderr = str::from_utf8(&result.stderr).unwrap();
-    assert!(stderr.contains("Did not have permissions for all directories"));
+    assert!(stderr.contains("No such file or directory"));
 }
 
 #[test]
@@ -117,6 +136,15 @@ pub fn test_show_files_by_type() {
 }
 
 #[test]
+#[cfg(target_family = "unix")]
+pub fn test_show_files_only() {
+    let output = build_command(vec!["-c", "-F", "tests/test_dir"]);
+    assert!(output.contains("a_file"));
+    assert!(output.contains("hello_file"));
+    assert!(!output.contains("many"));
+}
+
+#[test]
 pub fn test_output_skip_total() {
     let output = build_command(vec![
         "--skip-total",
@@ -125,6 +153,23 @@ pub fn test_output_skip_total() {
     ]);
     assert!(output.contains("hello_file"));
     assert!(!output.contains("(total)"));
+}
+
+#[test]
+pub fn test_output_screen_reader() {
+    let output = build_command(vec!["--screen-reader", "-c", "tests/test_dir/"]);
+    println!("{}", output);
+    assert!(output.contains("test_dir   0"));
+    assert!(output.contains("many       1"));
+    assert!(output.contains("hello_file 2"));
+    assert!(output.contains("a_file     2"));
+
+    // Verify no 'symbols' reported by screen reader
+    assert!(!output.contains('│'));
+
+    for block in ['█', '▓', '▒', '░'] {
+        assert!(!output.contains(block));
+    }
 }
 
 #[test]
@@ -192,4 +237,43 @@ pub fn test_show_files_by_invert_regex_match_multiple() {
     assert!(!output.contains("test_dir2"));
     assert!(!output.contains("test_dir_unicode"));
     assert!(output.contains("many"));
+}
+
+#[test]
+pub fn test_no_color() {
+    let output = build_command(vec!["-c"]);
+    // Red is 31
+    assert!(!output.contains("\x1B[31m"));
+    assert!(!output.contains("\x1B[0m"));
+}
+
+#[test]
+pub fn test_force_color() {
+    let output = build_command(vec!["-C"]);
+    // Red is 31
+    assert!(output.contains("\x1B[31m"));
+    assert!(output.contains("\x1B[0m"));
+}
+
+#[test]
+pub fn test_collapse() {
+    let output = build_command(vec!["--collapse", "many", "tests/test_dir/"]);
+    assert!(output.contains("many"));
+    assert!(!output.contains("hello_file"));
+}
+
+#[test]
+pub fn test_handle_duplicate_names() {
+    // Check that even if we run on a multiple directories with the same name
+    // we still show the distinct parent dir in the output
+    let output = build_command(vec![
+        "tests/test_dir_matching/dave/dup_name",
+        "tests/test_dir_matching/andy/dup_name",
+        "ci",
+    ]);
+    assert!(output.contains("andy"));
+    assert!(output.contains("dave"));
+    assert!(output.contains("ci"));
+    assert!(output.contains("dup_name"));
+    assert!(!output.contains("test_dir_matching"));
 }
